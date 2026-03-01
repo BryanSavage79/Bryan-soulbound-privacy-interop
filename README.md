@@ -20,3 +20,4 @@ This repository implements a modular, privacy-first soulbound identity system. I
 - **Secure & Auditable** — Focused contracts and circuits for easier security reviews.
 
 ## Project Structure
+. ├── contracts/              # Solidity smart contracts (SBT minter/verifier/privacy extensions) │   ├── SoulboundIdentity.sol │   └── PrivacyVerifier.sol ├── circuits/               # ZK circuits (e.g., Circom for proof generation/verification) ├── sdk/                    # TypeScript/JavaScript SDK for frontend/dApp integration ├── scripts/                # Deployment, testing, and cross-chain interaction scripts ├── examples/               # Demo integrations (e.g., simple dApp, cross-chain query) ├── tests/                  # Unit/integration tests (Hardhat/Foundry/Chai) ├── .gitignore ├── LICENSE                 # MIT License └── README.md
