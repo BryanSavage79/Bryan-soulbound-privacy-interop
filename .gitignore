@@ -137,3 +137,46 @@ dist
 # Vite logs files
 vite.config.js.timestamp-*
 vite.config.ts.timestamp-*
+# See https://github.com/github/gitignore/blob/main/Node.gitignore for full Node base
+# (copy that first, then add below)
+
+# === Next.js extras (if relevant) ===
+.next
+.next/cache
+out
+
+# === Solidity / Hardhat / Foundry ===
+artifacts/
+cache/
+typechain/
+coverage/
+coverage.json
+.openzeppelin/
+.hardhat/
+broadcast/
+out/
+forge-artifacts/   # sometimes used
+
+# === ZK / Circuits ===
+*.r1cs
+*.zkey
+*.wasm
+*.sym
+powersOfTau*
+trusted-setup/
+build/circuits/
+target/
+proofs/
+*.json  # be selective – don't ignore package.json!
+
+# === Env & Secrets ===
+.env
+.env.*
+!.env.example
+
+# === Misc ===
+*.log
+.DS_Store
+.idea/
+.vscode/
+*.swp
