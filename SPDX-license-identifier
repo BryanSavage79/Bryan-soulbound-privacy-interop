@@ -1,0 +1,352 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+// ============================================================
+// Minimal LayerZero V2 interfaces (endpoint + receiver)
+// ============================================================
+
+interface ILayerZeroEndpointV2 {
+    struct MessagingFee {
+        uint256 nativeFee;
+        uint256 lzTokenFee;
+    }
+
+    function quote(
+        uint32 _dstEid,
+        bytes calldata _payload,
+        bytes calldata _options,
+        bool _payInLzToken
+    ) external view returns (MessagingFee memory);
+
+    function send(
+        uint32 _dstEid,
+        bytes calldata _payload,
+        bytes calldata _options,
+        MessagingFee calldata _fee,
+        address _refundAddress
+    ) external payable;
+}
+
+interface ILayerZeroReceiver {
+    function lzReceive(
+        uint32 _srcEid,
+        bytes32 _sender,   // remote sender address (packed)
+        bytes calldata _payload
+    ) external;
+}
+
+// ============================================================
+// IPrivacyRitualRootReceiver
+// Interface that PrivacyRitual* contracts implement to store roots
+// when receiving LZ messages from the Base hub.
+// ============================================================
+
+interface IPrivacyRitualRootReceiver {
+    function onRootReceived(
+        uint256 groupId,
+        bytes32 groupRoot
+    ) external;
+}
+
+// ============================================================
+// InterchangeHubBase.sol
+// Base-chain root authority + LZ broadcaster.
+// - Stores canonical group roots
+// - Broadcasts updates to configured remote chains
+// - Remote chains wire their PrivacyRitual* as LZ receivers
+// ============================================================
+
+contract InterchangeHubBase is ILayerZeroReceiver {
+
+    // --------------------------------------------------------
+    // Events
+    // --------------------------------------------------------
+
+    event GroupRootUpdated(
+        uint256 indexed groupId,
+        bytes32 indexed newRoot,
+        uint64  timestamp
+    );
+
+    event RootBroadcastScheduled(
+        uint256 indexed groupId,
+        bytes32 indexed newRoot,
+        uint32  indexed dstEid,
+        address ritualReceiver
+    );
+
+    event RootBroadcastDelivered(
+        uint256 indexed groupId,
+        bytes32 indexed newRoot,
+        uint32  indexed srcEid,
+        address ritualReceiver
+    );
+
+    // --------------------------------------------------------
+    // Access control (simple owner for now)
+    // --------------------------------------------------------
+
+    address public owner;
+
+    modifier onlyOwner() {
+        require(msg.sender == owner, "Hub: not owner");
+        _;
+    }
+
+    // --------------------------------------------------------
+    // LayerZero + chain config
+    // --------------------------------------------------------
+
+    ILayerZeroEndpointV2 public immutable lzEndpoint;
+
+    struct ChainConfig {
+        uint32  eid;            // LZ endpoint ID
+        address ritualReceiver; // PrivacyRitual* contract on that chain
+        bool    enabled;
+    }
+
+    // dstEid => config
+    mapping(uint32 => ChainConfig) public chainConfigs;
+
+    // groupId => (root, timestamp)
+    mapping(uint256 => bytes32) private _groupRoots;
+    mapping(uint256 => uint64)  private _groupRootTimestamps;
+
+    // --------------------------------------------------------
+    // Constructor
+    // --------------------------------------------------------
+
+    constructor(address _lzEndpoint) {
+        owner      = msg.sender;
+        lzEndpoint = ILayerZeroEndpointV2(_lzEndpoint);
+    }
+
+    // --------------------------------------------------------
+    // Ownership
+    // --------------------------------------------------------
+
+    function transferOwnership(address newOwner) external onlyOwner {
+        require(newOwner != address(0), "Hub: zero owner");
+        owner = newOwner;
+    }
+
+    // --------------------------------------------------------
+    // Chain configuration
+    // --------------------------------------------------------
+
+    function setChainConfig(
+        uint32  eid,
+        address ritualReceiver,
+        bool    enabled
+    ) external onlyOwner {
+        require(ritualReceiver != address(0), "Hub: zero ritual");
+        chainConfigs[eid] = ChainConfig({
+            eid: eid,
+            ritualReceiver: ritualReceiver,
+            enabled: enabled
+        });
+    }
+
+    // --------------------------------------------------------
+    // Group root authority (Base canonical storage)
+// --------------------------------------------------------
+
+    function getGroupRoot(uint256 groupId)
+        external
+        view
+        returns (bytes32 root, uint64 updatedAt)
+    {
+        return (_groupRoots[groupId], _groupRootTimestamps[groupId]);
+    }
+
+    /**
+     * @notice Set a new canonical root for a group on Base.
+     * @dev    Called after membership changes (join/leave/ban).
+     *         This does NOT broadcast automatically; you can
+     *         either:
+     *           - call broadcastRootToAll(), or
+     *           - call broadcastRootToChain() per chain.
+     */
+    function setGroupRoot(
+        uint256 groupId,
+        bytes32 newRoot
+    ) external onlyOwner {
+        _groupRoots[groupId]         = newRoot;
+        _groupRootTimestamps[groupId] = uint64(block.timestamp);
+
+        emit GroupRootUpdated(groupId, newRoot, uint64(block.timestamp));
+    }
+
+    // --------------------------------------------------------
+    // Root broadcasting (LayerZero V2)
+// --------------------------------------------------------
+
+    // Payload schema:
+    //   abi.encode(
+    //     uint256 groupId,
+    //     bytes32 groupRoot
+    //   )
+
+    function _encodeRootPayload(
+        uint256 groupId,
+        bytes32 groupRoot
+    ) internal pure returns (bytes memory) {
+        return abi.encode(groupId, groupRoot);
+    }
+
+    /**
+     * @notice Quote the fee to broadcast a root to a single chain.
+     */
+    function quoteBroadcastRoot(
+        uint32  dstEid,
+        uint256 groupId
+    ) external view returns (ILayerZeroEndpointV2.MessagingFee memory fee) {
+        ChainConfig memory cfg = chainConfigs[dstEid];
+        require(cfg.enabled, "Hub: chain disabled");
+
+        bytes32 root = _groupRoots[groupId];
+        bytes memory payload = _encodeRootPayload(groupId, root);
+
+        // Options can be tuned later (gas limits, etc.)
+        bytes memory options = bytes("");
+
+        fee = lzEndpoint.quote(
+            dstEid,
+            payload,
+            options,
+            false // pay in native
+        );
+    }
+
+    /**
+     * @notice Broadcast a group root to a specific chain.
+     * @dev    msg.value must cover fee.nativeFee.
+     */
+    function broadcastRootToChain(
+        uint32  dstEid,
+        uint256 groupId
+    ) external payable onlyOwner {
+        ChainConfig memory cfg = chainConfigs[dstEid];
+        require(cfg.enabled, "Hub: chain disabled");
+
+        bytes32 root = _groupRoots[groupId];
+        require(root != bytes32(0), "Hub: no root");
+
+        bytes memory payload = _encodeRootPayload(groupId, root);
+        bytes memory options = bytes("");
+
+        ILayerZeroEndpointV2.MessagingFee memory fee = lzEndpoint.quote(
+            dstEid,
+            payload,
+            options,
+            false
+        );
+
+        require(msg.value >= fee.nativeFee, "Hub: insufficient fee");
+
+        emit RootBroadcastScheduled(groupId, root, dstEid, cfg.ritualReceiver);
+
+        lzEndpoint.send{value: fee.nativeFee}(
+            dstEid,
+            payload,
+            options,
+            fee,
+            msg.sender // refund any excess
+        );
+    }
+
+    /**
+     * @notice Broadcast a group root to all enabled chains.
+     * @dev    You should pre‑quote per chain off‑chain and send
+     *         enough msg.value to cover all fees.
+     */
+    function broadcastRootToAll(
+        uint256 groupId,
+        uint32[] calldata dstEids
+    ) external payable onlyOwner {
+        uint256 remaining = msg.value;
+
+        for (uint256 i = 0; i < dstEids.length; i++) {
+            uint32 dstEid = dstEids[i];
+            ChainConfig memory cfg = chainConfigs[dstEid];
+            if (!cfg.enabled) continue;
+
+            bytes32 root = _groupRoots[groupId];
+            if (root == bytes32(0)) continue;
+
+            bytes memory payload = _encodeRootPayload(groupId, root);
+            bytes memory options = bytes("");
+
+            ILayerZeroEndpointV2.MessagingFee memory fee = lzEndpoint.quote(
+                dstEid,
+                payload,
+                options,
+                false
+            );
+
+            require(remaining >= fee.nativeFee, "Hub: insufficient batch fee");
+            remaining -= fee.nativeFee;
+
+            emit RootBroadcastScheduled(groupId, root, dstEid, cfg.ritualReceiver);
+
+            lzEndpoint.send{value: fee.nativeFee}(
+                dstEid,
+                payload,
+                options,
+                fee,
+                msg.sender
+            );
+        }
+
+        // refund leftover
+        if (remaining > 0) {
+            (bool ok, ) = msg.sender.call{value: remaining}("");
+            require(ok, "Hub: refund failed");
+        }
+    }
+
+    // --------------------------------------------------------
+    // LayerZero receive hook
+    // --------------------------------------------------------
+    // In most flows, Base is the root authority and does not
+    // accept roots from other chains. But we implement lzReceive
+    // so the hub can still participate in multi‑authority setups
+    // later if needed.
+// --------------------------------------------------------
+
+    function lzReceive(
+        uint32 _srcEid,
+        bytes32 _sender,
+        bytes calldata _payload
+    ) external override {
+        require(msg.sender == address(lzEndpoint), "Hub: invalid caller");
+
+        // Decode payload
+        (uint256 groupId, bytes32 groupRoot) = abi.decode(
+            _payload,
+            (uint256, bytes32)
+        );
+
+        // Optional: accept only from known ritualReceiver for that eid
+        ChainConfig memory cfg = chainConfigs[_srcEid];
+        require(cfg.enabled, "Hub: src disabled");
+
+        // If you ever want to support "remote authority", you could:
+        // - store the root here, or
+        // - just emit an event.
+        emit RootBroadcastDelivered(
+            groupId,
+            groupRoot,
+            _srcEid,
+            _toAddress(_sender)
+        );
+    }
+
+    // Helper: unpack bytes32 sender into address
+    function _toAddress(bytes32 sender) internal pure returns (address) {
+        return address(uint160(uint256(sender)));
+    }
+
+    // Allow receiving native for refunds
+    receive() external payable {}
+}
